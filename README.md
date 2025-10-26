@@ -6,7 +6,7 @@ A framework-agnostic frontend toolkit that helps developers run confidential dAp
 
 Try the SDK in action on **Sepolia testnet**:
 
-- [Project Index](https://showcase.starfrich.me)
+- [Project Index](https://sdk.starfrich.me)
 - [Website Documentation](https://starfrich.me/projects/zama-sdk/)
 
 > **📝 Note:** Live demos require:
