@@ -1,6 +1,5 @@
 import "@rainbow-me/rainbowkit/styles.css";
 import { DappWrapperWithProviders } from "~~/components/DappWrapperWithProviders";
-import { ThemeProvider } from "~~/components/ThemeProvider";
 import "~~/styles/globals.css";
 import { getMetadata } from "~~/utils/helper/getMetadata";
 
@@ -11,7 +10,7 @@ export const metadata = getMetadata({
 
 const DappWrapper = ({ children }: { children: React.ReactNode }) => {
   return (
-    <html suppressHydrationWarning className={``}>
+    <html suppressHydrationWarning data-theme="zama">
       <head>
         <link
           href="https://api.fontshare.com/v2/css?f[]=telegraf@400,500,700&display=swap"
@@ -19,9 +18,7 @@ const DappWrapper = ({ children }: { children: React.ReactNode }) => {
         />
       </head>
       <body>
-        <ThemeProvider enableSystem>
-          <DappWrapperWithProviders>{children}</DappWrapperWithProviders>
-        </ThemeProvider>
+        <DappWrapperWithProviders>{children}</DappWrapperWithProviders>
       </body>
     </html>
   );

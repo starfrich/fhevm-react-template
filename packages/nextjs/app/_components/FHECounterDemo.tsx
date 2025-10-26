@@ -1,21 +1,32 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState, useEffect } from "react";
 import { useFhevm } from "@fhevm-sdk";
 import { useAccount } from "wagmi";
 import { RainbowKitCustomConnectButton } from "~~/components/helper/RainbowKitCustomConnectButton";
 import { useFHECounterWagmi } from "~~/hooks/fhecounter-example/useFHECounterWagmi";
+import { useIndexedDBStorage } from "~~/hooks/helper/useIndexedDBStorage";
+import { toggleDebugMode, isDebugEnabled, initializeDebugMode, logDebug } from "~/lib/utils";
 
 /*
  * Main FHECounter React component with 3 buttons
  *  - "Decrypt" button: allows you to decrypt the current FHECounter count handle.
  *  - "Increment" button: allows you to increment the FHECounter count handle using FHE operations.
  *  - "Decrement" button: allows you to decrement the FHECounter count handle using FHE operations.
+ *
+ * Uses IndexedDB storage for persistent decryption signatures (survives page reload).
  */
 export const FHECounterDemo = () => {
   const { isConnected, chain } = useAccount();
+  const [debugEnabled, setDebugEnabled] = useState(false);
 
   const chainId = chain?.id;
+
+  // Initialize debug mode from localStorage on component mount
+  useEffect(() => {
+    initializeDebugMode();
+    setDebugEnabled(isDebugEnabled());
+  }, []);
 
   //////////////////////////////////////////////////////////////////////////////
   // FHEVM instance
@@ -43,15 +54,26 @@ export const FHECounterDemo = () => {
   });
 
   //////////////////////////////////////////////////////////////////////////////
+  // IndexedDB Storage for persistent decryption signatures
+  // This means signatures survive page reload - user doesn't need to re-sign!
+  //////////////////////////////////////////////////////////////////////////////
+
+  const { storage: indexedDBStorage, isReady: storageReady, error: storageError } = useIndexedDBStorage({
+    dbName: "fhevm-nextjs-app",
+    storeName: "signatures",
+  });
+
+  //////////////////////////////////////////////////////////////////////////////
   // useFHECounter is a custom hook containing all the FHECounter logic, including
   // - calling the FHECounter contract
   // - encrypting FHE inputs
-  // - decrypting FHE handles
+  // - decrypting FHE handles (with persistent storage!)
   //////////////////////////////////////////////////////////////////////////////
 
   const fheCounter = useFHECounterWagmi({
     instance: fhevmInstance,
     initialMockChains,
+    storage: indexedDBStorage, // Use IndexedDB for persistence
   });
 
   //////////////////////////////////////////////////////////////////////////////
@@ -64,42 +86,26 @@ export const FHECounterDemo = () => {
   // - 1x "Decrement" button (to decrement the FHECounter)
   //////////////////////////////////////////////////////////////////////////////
 
-  const buttonClass =
-    "inline-flex items-center justify-center px-6 py-3 font-semibold shadow-lg " +
-    "transition-all duration-200 hover:scale-105 " +
-    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-gray-900 " +
-    "disabled:opacity-50 disabled:pointer-events-none disabled:cursor-not-allowed";
+  // DaisyUI cyberpunk theme button classes
+  const primaryButtonClass = "btn btn-primary btn-lg";
+  const secondaryButtonClass = "btn btn-secondary btn-lg";
+  const successButtonClass = "btn btn-accent btn-lg";
 
-  // Primary (accent) button — #FFD208 with dark text and warm hover #A38025
-  const primaryButtonClass =
-    buttonClass +
-    " bg-[#FFD208] text-[#2D2D2D] hover:bg-[#A38025] focus-visible:ring-[#2D2D2D]  cursor-pointer";
-
-  // Secondary (neutral dark) button — #2D2D2D with light text and accent focus
-  const secondaryButtonClass =
-    buttonClass +
-    " bg-black text-[#F4F4F4] hover:bg-[#1F1F1F] focus-visible:ring-[#FFD208] cursor-pointer";
-
-  // Success/confirmed state — deeper gold #A38025 with dark text
-  const successButtonClass =
-    buttonClass +
-    " bg-[#A38025] text-[#2D2D2D] hover:bg-[#8F6E1E] focus-visible:ring-[#2D2D2D]";
-
-  const titleClass = "font-bold text-gray-900 text-xl mb-4 border-b-1 border-gray-700 pb-2";
-  const sectionClass = "bg-[#f4f4f4] shadow-lg p-6 mb-6 text-gray-900";
+  const titleClass = "font-bold text-xl mb-4 border-b border-base-content/20 pb-2";
+  const sectionClass = "bg-base-200 shadow-xl p-6 mb-6";
 
   if (!isConnected) {
     return (
-      <div className="max-w-6xl mx-auto p-6 text-gray-900">
+      <div className="max-w-6xl mx-auto p-6">
         <div className="flex items-center justify-center">
-          <div className="bg-white bordershadow-xl p-8 text-center">
+          <div className="card bg-base-100 shadow-xl p-8 text-center max-w-md">
             <div className="mb-4">
-              <span className="inline-flex items-center justify-center w-14 h-14 rounded-full bg-amber-900/30 text-amber-400 text-3xl">
+              <span className="inline-flex items-center justify-center w-14 h-14 rounded-full bg-warning/30 text-warning text-3xl">
                 ⚠️
               </span>
             </div>
-            <h2 className="text-2xl font-extrabold text-gray-900 mb-2">Wallet not connected</h2>
-            <p className="text-gray-700 mb-6">Connect your wallet to use the FHE Counter demo.</p>
+            <h2 className="text-2xl font-extrabold mb-2">Wallet not connected</h2>
+            <p className="text-base-content/70 mb-6">Connect your wallet to use the FHE Counter demo.</p>
             <div className="flex items-center justify-center">
               <RainbowKitCustomConnectButton />
             </div>
@@ -110,11 +116,23 @@ export const FHECounterDemo = () => {
   }
 
   return (
-    <div className="max-w-6xl mx-auto p-6 space-y-6 text-gray-900">
+    <div className="max-w-6xl mx-auto p-6 space-y-6">
       {/* Header */}
-      <div className="text-center mb-8 text-black">
-        <h1 className="text-3xl font-bold mb-2">FHE Counter Demo</h1>
-        <p className="text-gray-600">Interact with the Fully Homomorphic Encryption Counter contract</p>
+      <div className="text-center mb-8">
+        <h1 className="text-3xl font-bold mb-2">🔐 FHE Counter Demo</h1>
+        <p className="text-base-content/70">Interact with the Fully Homomorphic Encryption Counter contract</p>
+        <div className="mt-4 flex justify-center gap-2 flex-wrap">
+          <button
+            onClick={() => {
+              const newState = toggleDebugMode();
+              setDebugEnabled(newState);
+              logDebug(`Debug mode ${newState ? "enabled" : "disabled"}`);
+            }}
+            className={`btn btn-sm gap-2 ${debugEnabled ? "btn-info" : "btn-ghost"}`}
+          >
+            🐛 {debugEnabled ? "Debug ON" : "Debug OFF"}
+          </button>
+        </div>
       </div>
 
       {/* Count Handle Display */}
@@ -127,7 +145,7 @@ export const FHECounterDemo = () => {
       </div>
 
       {/* Action Buttons */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-black">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <button
           className={fheCounter.isDecrypted ? successButtonClass : primaryButtonClass}
           disabled={!fheCounter.canDecrypt}
@@ -171,20 +189,30 @@ export const FHECounterDemo = () => {
       {fheCounter.message && (
         <div className={sectionClass}>
           <h3 className={titleClass}>💬 Messages</h3>
-          <div className="border bg-white border-gray-200 p-4">
-            <p className="text-gray-800">{fheCounter.message}</p>
+          <div className="alert alert-info">
+            <p>{fheCounter.message}</p>
           </div>
         </div>
       )}
 
       {/* Status Cards */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className={sectionClass}>
           <h3 className={titleClass}>🔧 FHEVM Instance</h3>
           <div className="space-y-3">
             {printProperty("Instance Status", fhevmInstance ? "✅ Connected" : "❌ Disconnected")}
             {printProperty("Status", fhevmStatus)}
             {printProperty("Error", fhevmError ?? "No errors")}
+          </div>
+        </div>
+
+        <div className={sectionClass}>
+          <h3 className={titleClass}>💾 Storage</h3>
+          <div className="space-y-3">
+            {printProperty("Type", storageReady ? "IndexedDB" : "Initializing...")}
+            {printProperty("Status", storageReady ? "✅ Ready" : "⏳ Loading")}
+            {printProperty("Persistent", storageReady && !storageError ? "✅ Yes" : "❌ No")}
+            {storageError && printProperty("Fallback", "localStorage/memory")}
           </div>
         </div>
 
@@ -223,9 +251,9 @@ function printProperty(name: string, value: unknown) {
     displayValue = JSON.stringify(value);
   }
   return (
-    <div className="flex justify-between items-center py-2 px-3 bg-white border border-gray-200 w-full">
-      <span className="text-gray-800 font-medium">{name}</span>
-      <span className="ml-2 font-mono text-sm font-semibold text-gray-900 bg-gray-100 px-2 py-1 border border-gray-300">
+    <div className="flex justify-between items-center py-2 px-3 bg-base-100 border border-base-content/20 w-full rounded">
+      <span className="font-medium">{name}</span>
+      <span className="ml-2 font-mono text-sm font-semibold bg-base-300 px-2 py-1 rounded">
         {displayValue}
       </span>
     </div>
@@ -234,15 +262,9 @@ function printProperty(name: string, value: unknown) {
 
 function printBooleanProperty(name: string, value: boolean) {
   return (
-    <div className="flex justify-between items-center py-2 px-3  bg-white border border-gray-200 w-full">
-      <span className="text-gray-700 font-medium">{name}</span>
-      <span
-        className={`font-mono text-sm font-semibold px-2 py-1 border ${
-          value
-            ? "text-green-800 bg-green-100 border-green-300"
-            : "text-red-800 bg-red-100 border-red-300"
-        }`}
-      >
+    <div className="flex justify-between items-center py-2 px-3 bg-base-100 border border-base-content/20 w-full rounded">
+      <span className="font-medium">{name}</span>
+      <span className={`badge badge-lg ${value ? "badge-success" : "badge-error"}`}>
         {value ? "✓ true" : "✗ false"}
       </span>
     </div>

@@ -10,11 +10,24 @@ import {
   useFHEDecrypt,
   useFHEEncryption,
   useInMemoryStorage,
+  useWalletCallbacks,
+  type IFhevmStorage,
 } from "@fhevm-sdk";
 import { ethers } from "ethers";
 import type { Contract } from "~~/utils/helper/contract";
 import type { AllowedChainIds } from "~~/utils/helper/networks";
 import { useReadContract } from "wagmi";
+import {
+  handleError,
+  shouldRetry,
+  isUserError,
+  validateAddress,
+  retryEncryptionOperation,
+  startPerformanceTimer,
+  logDebug,
+  logWarn,
+  logError,
+} from "~/lib/utils";
 
 /**
  * useFHECounterWagmi - Minimal FHE Counter hook for Wagmi devs
@@ -24,15 +37,21 @@ import { useReadContract } from "wagmi";
  * - Decrypts the handle on-demand with useFHEDecrypt
  * - Encrypts inputs and writes increment/decrement
  *
- * Pass your FHEVM instance and a simple key-value storage for the decryption signature.
- * That's it. Everything else is handled for you.
+ * Pass your FHEVM instance and an optional storage for the decryption signature.
+ * If no storage is provided, it will use in-memory storage by default.
+ * For persistent storage (survives page reload), pass IndexedDB storage.
  */
 export const useFHECounterWagmi = (parameters: {
   instance: FhevmInstance | undefined;
   initialMockChains?: Readonly<Record<number, string>>;
+  /** Storage for decryption signatures. Defaults to in-memory storage if not provided. */
+  storage?: IFhevmStorage;
 }) => {
-  const { instance, initialMockChains } = parameters;
-  const { storage: fhevmDecryptionSignatureStorage } = useInMemoryStorage();
+  const { instance, initialMockChains, storage: providedStorage } = parameters;
+  const { storage: defaultStorage } = useInMemoryStorage();
+
+  // Use provided storage or fall back to in-memory storage
+  const fhevmDecryptionSignatureStorage = providedStorage || defaultStorage;
 
   // Wagmi + ethers interop
   const { chainId, accounts, isConnected, ethersReadonlyProvider, ethersSigner } = useWagmiEthers(initialMockChains);
@@ -62,7 +81,7 @@ export const useFHECounterWagmi = (parameters: {
     if (!providerOrSigner) return undefined;
     return new ethers.Contract(
       fheCounter!.address,
-      (fheCounter as FHECounterInfo).abi,
+      JSON.stringify((fheCounter as FHECounterInfo).abi), // Convert to JSON string for ethers
       providerOrSigner,
     );
   };
@@ -83,14 +102,31 @@ export const useFHECounterWagmi = (parameters: {
   const countHandle = useMemo(() => (readResult.data as string | undefined) ?? undefined, [readResult.data]);
   const canGetCount = Boolean(hasContract && hasProvider && !readResult.isFetching);
   const refreshCountHandle = useCallback(async () => {
-    const res = await readResult.refetch();
-    if (res.error) setMessage("FHECounter.getCount() failed: " + (res.error as Error).message);
+    try {
+      logDebug("Refreshing count handle...");
+      const timer = startPerformanceTimer("refresh_count");
+      const res = await readResult.refetch();
+      const metric = timer();
+      logDebug(`Count refreshed in ${metric.durationMs}ms`);
+      if (res.error) {
+        const errorMsg = handleError(res.error);
+        setMessage(`Failed to read count: ${errorMsg}`);
+        logError("FHECounter.getCount() failed", res.error);
+      }
+    } catch (e) {
+      const errorMsg = handleError(e);
+      setMessage(errorMsg);
+      logError("Error refreshing count", e);
+    }
   }, [readResult]);
   // derive isRefreshing from wagmi
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const _derivedIsRefreshing = readResult.isFetching;
 
   // Wagmi handles initial fetch via `enabled`
+
+  // Create wallet callbacks from ethers signer
+  const { signTypedData, getAddress } = useWalletCallbacks({ ethersSigner });
 
   // Decrypt (reuse existing decrypt hook for simplicity)
   const requests = useMemo(() => {
@@ -106,7 +142,8 @@ export const useFHECounterWagmi = (parameters: {
     results,
   } = useFHEDecrypt({
     instance,
-    ethersSigner: ethersSigner as any,
+    signTypedData,
+    getAddress,
     fhevmDecryptionSignatureStorage,
     chainId,
     requests,
@@ -128,19 +165,45 @@ export const useFHECounterWagmi = (parameters: {
   const decryptCountHandle = decrypt;
 
   // Mutations (increment/decrement)
-  const { encryptWith } = useFHEEncryption({ instance, ethersSigner: ethersSigner as any, contractAddress: fheCounter?.address });
+  const { encryptWith } = useFHEEncryption({ instance, getAddress, contractAddress: fheCounter?.address });
   const canUpdateCounter = useMemo(
     () => Boolean(hasContract && instance && hasSigner && !isProcessing),
     [hasContract, instance, hasSigner, isProcessing],
   );
 
   const getEncryptionMethodFor = (functionName: "increment" | "decrement") => {
-    const functionAbi = fheCounter?.abi.find(item => item.type === "function" && item.name === functionName);
-    if (!functionAbi) return { method: undefined as string | undefined, error: `Function ABI not found for ${functionName}` } as const;
-    if (!functionAbi.inputs || functionAbi.inputs.length === 0)
-      return { method: undefined as string | undefined, error: `No inputs found for ${functionName}` } as const;
-    const firstInput = functionAbi.inputs[0]!;
-    return { method: getEncryptionMethod(firstInput.internalType), error: undefined } as const;
+    if (!fheCounter?.abi) {
+      return { method: undefined as string | undefined, error: "Contract ABI not available" } as const;
+    }
+
+    try {
+      // Find the function in ABI
+      const functionAbi = fheCounter.abi.find(
+        (item: any) => item.type === "function" && item.name === functionName
+      );
+
+      if (!functionAbi) {
+        return { method: undefined as string | undefined, error: `Function ABI not found for ${functionName}` } as const;
+      }
+
+      if (!functionAbi.inputs || functionAbi.inputs.length === 0) {
+        return { method: undefined as string | undefined, error: `No inputs found for ${functionName}` } as const;
+      }
+
+      // Get the internalType from the first parameter
+      const internalType = functionAbi.inputs[0].internalType as string;
+
+      if (!internalType) {
+        return { method: undefined as string | undefined, error: `No internalType found for ${functionName}` } as const;
+      }
+
+      // Use SDK utility to get the encryption method
+      const method = getEncryptionMethod(internalType);
+      return { method, error: undefined } as const;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : `Failed to get encryption method for ${functionName}`;
+      return { method: undefined as string | undefined, error: errorMsg } as const;
+    }
   };
 
   const updateCounter = useCallback(
@@ -150,32 +213,82 @@ export const useFHECounterWagmi = (parameters: {
       const valueAbs = Math.abs(value);
       setIsProcessing(true);
       setMessage(`Starting ${op}(${valueAbs})...`);
+
+      const timer = startPerformanceTimer(`counter_${op}`);
+
       try {
+        // Validate contract address
+        if (!validateAddress(fheCounter?.address)) {
+          const msg = handleError(new Error("Invalid contract address"));
+          setMessage(msg);
+          logError("Invalid contract address", fheCounter?.address);
+          return;
+        }
+
         const { method, error } = getEncryptionMethodFor(op);
-        if (!method) return setMessage(error ?? "Encryption method not found");
+        if (!method) {
+          const msg = error ?? "Encryption method not found";
+          setMessage(msg);
+          logWarn(`Encryption method not found for ${op}`);
+          return;
+        }
 
         setMessage(`Encrypting with ${method}...`);
-        const enc = await encryptWith(builder => {
-          (builder as any)[method](valueAbs);
+        logDebug(`Encrypting ${valueAbs} with ${method}`);
+
+        // Use retry for encryption operation
+        const enc = await retryEncryptionOperation(async () => {
+          return await encryptWith(builder => {
+            (builder as any)[method](valueAbs);
+          });
         });
-        if (!enc) return setMessage("Encryption failed");
+
+        if (!enc) {
+          const msg = handleError(new Error("Encryption failed"));
+          setMessage(msg);
+          logError("Encryption operation returned null");
+          return;
+        }
 
         const writeContract = getContract("write");
-        if (!writeContract) return setMessage("Contract info or signer not available");
+        if (!writeContract) {
+          const msg = "Contract info or signer not available";
+          setMessage(msg);
+          logWarn(msg);
+          return;
+        }
 
         const params = buildParamsFromAbi(enc, [...fheCounter!.abi] as any[], op);
         const tx = await (op === "increment" ? writeContract.increment(...params) : writeContract.decrement(...params));
         setMessage("Waiting for transaction...");
+        logDebug(`Transaction sent: ${tx.hash}`);
+
         await tx.wait();
+        const metric = timer();
+        logDebug(`${op}(${valueAbs}) completed in ${metric.durationMs}ms`);
         setMessage(`${op}(${valueAbs}) completed!`);
         refreshCountHandle();
       } catch (e) {
-        setMessage(`${op} failed: ${e instanceof Error ? e.message : String(e)}`);
+        const isUserActionErr = isUserError(e);
+        const errorMsg = handleError(e);
+
+        if (isUserActionErr) {
+          logDebug(`User declined ${op} operation`);
+          setMessage(`You declined the ${op} operation`);
+        } else {
+          logError(`${op} operation failed`, e);
+          setMessage(`${op} failed: ${errorMsg}`);
+
+          // Suggest retry if applicable
+          if (shouldRetry(e)) {
+            logWarn(`${op} failed but is retryable - consider retrying`);
+          }
+        }
       } finally {
         setIsProcessing(false);
       }
     },
-    [isProcessing, canUpdateCounter, encryptWith, getContract, refreshCountHandle, fheCounter?.abi],
+    [isProcessing, canUpdateCounter, encryptWith, getContract, refreshCountHandle, fheCounter?.abi, fheCounter?.address],
   );
 
   return {

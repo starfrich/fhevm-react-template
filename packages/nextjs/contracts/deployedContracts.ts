@@ -4,10 +4,10 @@
  */
 import { GenericContractsDeclaration } from "~~/utils/helper/contract";
 
-const deployedContracts = {
+export const deployedContracts = {
   31337: {
     FHECounter: {
-      address: "0x40e8Aa088739445BC3a3727A724F56508899f65B",
+      address: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
       abi: [
         {
           inputs: [
@@ -78,7 +78,7 @@ const deployedContracts = {
   },
   11155111: {
     FHECounter: {
-      address: "0xead137D42d2E6A6a30166EaEf97deBA1C3D1954e",
+      address: "0xA25a9Cbae6a9ea52F25259c1D850C30a9FbA4A3A",
       abi: [
         {
           inputs: [
@@ -144,7 +144,7 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 9368216,
+      deployedOnBlock: 9395075,
     },
   },
 } as const;

@@ -1,29 +1,143 @@
 "use client";
 
-import { useCallback, useMemo, useRef, useState } from "react";
-import { FhevmDecryptionSignature } from "../FhevmDecryptionSignature.js";
-import { GenericStringStorage } from "../storage/GenericStringStorage.js";
-import { FhevmInstance } from "../fhevmTypes.js";
-import { ethers } from "ethers";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FhevmDecryptionSignature } from "../FhevmDecryptionSignature";
+import { GenericStringStorage } from "../storage/GenericStringStorage";
+import type { FhevmInstance } from "../core/types";
+import { FhevmError, FhevmErrorCode, getErrorMessage } from "../types/errors";
+import {
+  decryptBatch,
+  getUniqueContractAddresses,
+  type DecryptionRequest,
+} from "../core/decryption";
+import type { SignTypedDataCallback, GetAddressCallback } from "../types/callbacks";
 
-export type FHEDecryptRequest = { handle: string; contractAddress: `0x${string}` };
+// Re-export DecryptionRequest as FHEDecryptRequest for backward compatibility
+export type FHEDecryptRequest = DecryptionRequest;
 
-export const useFHEDecrypt = (params: {
+/**
+ * Options for retry behavior in decryption
+ */
+export interface UseFHEDecryptRetryOptions {
+  /** Maximum number of retry attempts (default: 2) */
+  maxRetries?: number;
+  /** Delay in milliseconds between retries (default: 1500ms) */
+  retryDelay?: number;
+}
+
+/**
+ * Parameters for useFHEDecrypt hook
+ */
+export interface UseFHEDecryptParams {
+  /** FHEVM instance for decryption operations */
   instance: FhevmInstance | undefined;
-  ethersSigner: ethers.JsonRpcSigner | undefined;
+  /** Callback for signing EIP-712 typed data (framework-agnostic) */
+  signTypedData: SignTypedDataCallback | undefined;
+  /** Callback for getting user address (framework-agnostic) */
+  getAddress: GetAddressCallback | undefined;
+  /** Storage for caching decryption signatures */
   fhevmDecryptionSignatureStorage: GenericStringStorage;
+  /** Current chain ID */
   chainId: number | undefined;
+  /** Array of decryption requests (handles to decrypt) */
   requests: readonly FHEDecryptRequest[] | undefined;
-}) => {
-  const { instance, ethersSigner, fhevmDecryptionSignatureStorage, chainId, requests } = params;
+  /** Auto-decrypt when requests change (default: false) */
+  autoDecrypt?: boolean;
+  /** Retry options for failed decryptions */
+  retry?: UseFHEDecryptRetryOptions | false;
+  /** Callback fired on successful decryption */
+  onSuccess?: (results: Record<string, string | bigint | boolean>) => void;
+  /** Callback fired on decryption error */
+  onError?: (error: Error) => void;
+}
+
+/**
+ * Return type for useFHEDecrypt hook
+ */
+export interface UseFHEDecryptReturn {
+  /** Whether decryption is possible */
+  canDecrypt: boolean;
+  /** Trigger decryption manually */
+  decrypt: () => void;
+  /** Whether decryption is in progress */
+  isDecrypting: boolean;
+  /** Progress message */
+  message: string;
+  /** Decryption results (handle -> decrypted value) */
+  results: Record<string, string | bigint | boolean>;
+  /** Last decryption error */
+  error: string | null;
+  /** User-friendly error message */
+  errorMessage: string | undefined;
+  /** Current retry attempt number */
+  retryCount: number;
+  /** Set custom message */
+  setMessage: (msg: string) => void;
+  /** Set custom error */
+  setError: (err: string | null) => void;
+}
+
+/**
+ * Hook for decrypting FHEVM handles
+ *
+ * Provides decryption utilities with automatic caching, retry logic,
+ * and progress tracking.
+ *
+ * @example
+ * ```typescript
+ * // With ethers.js
+ * const signTypedData = useCallback(async (domain, types, message) => {
+ *   return await signer.signTypedData(domain, types, message);
+ * }, [signer]);
+ *
+ * const getAddress = useCallback(async () => {
+ *   return await signer.getAddress();
+ * }, [signer]);
+ *
+ * const { canDecrypt, decrypt, isDecrypting, results } = useFHEDecrypt({
+ *   instance,
+ *   signTypedData,
+ *   getAddress,
+ *   fhevmDecryptionSignatureStorage,
+ *   chainId,
+ *   requests: [{ handle: '0x123...', contractAddress: '0xabc...' }],
+ *   autoDecrypt: true,
+ *   retry: { maxRetries: 3, retryDelay: 2000 },
+ *   onSuccess: (results) => console.log('Decrypted:', results),
+ *   onError: (error) => console.error('Decryption failed:', error)
+ * });
+ * ```
+ */
+export const useFHEDecrypt = (params: UseFHEDecryptParams): UseFHEDecryptReturn => {
+  const {
+    instance,
+    signTypedData,
+    getAddress,
+    fhevmDecryptionSignatureStorage,
+    chainId,
+    requests,
+    autoDecrypt = false,
+    retry = { maxRetries: 2, retryDelay: 1500 },
+    onSuccess,
+    onError,
+  } = params;
+
+  // Retry configuration
+  const retryConfig = retry === false ? null : {
+    maxRetries: retry?.maxRetries ?? 2,
+    retryDelay: retry?.retryDelay ?? 1500,
+  };
 
   const [isDecrypting, setIsDecrypting] = useState<boolean>(false);
   const [message, setMessage] = useState<string>("");
   const [results, setResults] = useState<Record<string, string | bigint | boolean>>({});
   const [error, setError] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | undefined>(undefined);
+  const [retryCount, setRetryCount] = useState<number>(0);
 
   const isDecryptingRef = useRef<boolean>(isDecrypting);
   const lastReqKeyRef = useRef<string>("");
+  const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const requestsKey = useMemo(() => {
     if (!requests || requests.length === 0) return "";
@@ -34,87 +148,164 @@ export const useFHEDecrypt = (params: {
   }, [requests]);
 
   const canDecrypt = useMemo(() => {
-    return Boolean(instance && ethersSigner && requests && requests.length > 0 && !isDecrypting);
-  }, [instance, ethersSigner, requests, isDecrypting]);
+    return Boolean(instance && signTypedData && getAddress && requests && requests.length > 0 && !isDecrypting);
+  }, [instance, signTypedData, getAddress, requests, isDecrypting]);
 
-  const decrypt = useCallback(() => {
-    if (isDecryptingRef.current) return;
-    if (!instance || !ethersSigner || !requests || requests.length === 0) return;
+  const decrypt = useCallback((attemptNumber: number = 0) => {
+    if (isDecryptingRef.current && attemptNumber === 0) return;
+    if (!instance || !signTypedData || !getAddress || !requests || requests.length === 0) return;
 
     const thisChainId = chainId;
-    const thisSigner = ethersSigner;
+    const thisSignTypedData = signTypedData;
+    const thisGetAddress = getAddress;
     const thisRequests = requests;
 
     // Capture the current requests key to avoid false "stale" detection on first run
-    lastReqKeyRef.current = requestsKey;
+    if (attemptNumber === 0) {
+      lastReqKeyRef.current = requestsKey;
+    }
 
     isDecryptingRef.current = true;
     setIsDecrypting(true);
-    setMessage("Start decrypt");
+    setMessage(attemptNumber > 0 ? `Retrying decryption (attempt ${attemptNumber + 1})...` : "Start decrypt");
     setError(null);
+    setErrorMessage(undefined);
+
+    if (attemptNumber > 0) {
+      setRetryCount(attemptNumber);
+    }
 
     const run = async () => {
       const isStale = () =>
-        thisChainId !== chainId || thisSigner !== ethersSigner || requestsKey !== lastReqKeyRef.current;
+        thisChainId !== chainId || thisSignTypedData !== signTypedData || thisGetAddress !== getAddress || requestsKey !== lastReqKeyRef.current;
 
       try {
-        const uniqueAddresses = Array.from(new Set(thisRequests.map(r => r.contractAddress)));
+        // Use core utility to get unique addresses
+        const uniqueAddresses = getUniqueContractAddresses(thisRequests);
+
         const sig: FhevmDecryptionSignature | null = await FhevmDecryptionSignature.loadOrSign(
           instance,
-          uniqueAddresses as `0x${string}`[],
-          ethersSigner,
+          uniqueAddresses,
+          thisSignTypedData,
+          thisGetAddress,
           fhevmDecryptionSignatureStorage,
         );
 
         if (!sig) {
-          setMessage("Unable to build FHEVM decryption signature");
-          setError("SIGNATURE_ERROR: Failed to create decryption signature");
-          return;
-        }
-
-        if (isStale()) {
-          setMessage("Ignore FHEVM decryption");
-          return;
-        }
-
-        setMessage("Call FHEVM userDecrypt...");
-
-        const mutableReqs = thisRequests.map(r => ({ handle: r.handle, contractAddress: r.contractAddress }));
-        let res: Record<string, string | bigint | boolean> = {};
-        try {
-          res = await instance.userDecrypt(
-            mutableReqs,
-            sig.privateKey,
-            sig.publicKey,
-            sig.signature,
-            sig.contractAddresses,
-            sig.userAddress,
-            sig.startTimestamp,
-            sig.durationDays,
+          const err = new FhevmError(
+            FhevmErrorCode.SIGNATURE_FAILED,
+            "Failed to create decryption signature. Please try again."
           );
-        } catch (e) {
-          const err = e as unknown as { name?: string; message?: string };
-          const code = err && typeof err === "object" && "name" in (err as any) ? (err as any).name : "DECRYPT_ERROR";
-          const msg = err && typeof err === "object" && "message" in (err as any) ? (err as any).message : "Decryption failed";
-          setError(`${code}: ${msg}`);
-          setMessage("FHEVM userDecrypt failed");
-          return;
+          throw err;
         }
-
-        setMessage("FHEVM userDecrypt completed!");
 
         if (isStale()) {
-          setMessage("Ignore FHEVM decryption");
+          setMessage("Decryption cancelled (stale request)");
+          isDecryptingRef.current = false;
+          setIsDecrypting(false);
+          setRetryCount(0);
           return;
         }
 
-        setResults(res);
+        // Use core decryption utility
+        const decryptionResult = await decryptBatch({
+          instance,
+          requests: thisRequests,
+          signature: {
+            publicKey: sig.publicKey,
+            privateKey: sig.privateKey,
+            signature: sig.signature,
+            contractAddresses: sig.contractAddresses,
+            userAddress: sig.userAddress,
+            startTimestamp: sig.startTimestamp,
+            durationDays: sig.durationDays,
+          },
+          onProgress: (msg) => setMessage(msg),
+        });
+
+        if (!decryptionResult.success) {
+          const err = new FhevmError(
+            FhevmErrorCode.DECRYPTION_FAILED,
+            `Decryption failed: ${decryptionResult.error}`
+          );
+          throw err;
+        }
+
+        if (isStale()) {
+          setMessage("Decryption cancelled (stale request)");
+          isDecryptingRef.current = false;
+          setIsDecrypting(false);
+          setRetryCount(0);
+          return;
+        }
+
+        // Success!
+        setResults(decryptionResult.results);
+        setMessage("Decryption completed successfully");
+        setError(null);
+        setErrorMessage(undefined);
+        setRetryCount(0);
+
+        // Call success callback
+        if (onSuccess) {
+          try {
+            onSuccess(decryptionResult.results);
+          } catch (callbackError) {
+            console.error("[useFHEDecrypt] onSuccess callback error:", callbackError);
+          }
+        }
       } catch (e) {
-        const err = e as unknown as { name?: string; message?: string };
-        const code = err && typeof err === "object" && "name" in (err as any) ? (err as any).name : "UNKNOWN_ERROR";
-        const msg = err && typeof err === "object" && "message" in (err as any) ? (err as any).message : "Unknown error";
+        const err = e instanceof Error ? e : new Error(String(e));
+
+        if (isStale()) {
+          setMessage("Decryption cancelled (stale request)");
+          isDecryptingRef.current = false;
+          setIsDecrypting(false);
+          setRetryCount(0);
+          return;
+        }
+
+        // Check if we should retry
+        const shouldRetry = retryConfig && attemptNumber < retryConfig.maxRetries;
+
+        if (shouldRetry) {
+          const nextAttempt = attemptNumber + 1;
+          const delay = retryConfig!.retryDelay;
+
+          console.log(`[useFHEDecrypt] Retry attempt ${nextAttempt}/${retryConfig!.maxRetries} after ${delay}ms`);
+          setMessage(`Decryption failed, retrying in ${delay}ms...`);
+
+          retryTimeoutRef.current = setTimeout(() => {
+            if (!isStale()) {
+              decrypt(nextAttempt);
+            }
+          }, delay);
+          return;
+        }
+
+        // Final error - no more retries
+        const fhevmErr = err instanceof FhevmError ? err : new FhevmError(
+          FhevmErrorCode.DECRYPTION_FAILED,
+          `Decryption failed: ${err.message}`,
+          err
+        );
+
+        const code = fhevmErr.code || "UNKNOWN_ERROR";
+        const msg = fhevmErr.message;
+
         setError(`${code}: ${msg}`);
-        setMessage("FHEVM decryption errored");
+        setErrorMessage(getErrorMessage(fhevmErr));
+        setMessage("FHEVM decryption failed");
+        setRetryCount(0);
+
+        // Call error callback
+        if (onError) {
+          try {
+            onError(fhevmErr);
+          } catch (callbackError) {
+            console.error("[useFHEDecrypt] onError callback error:", callbackError);
+          }
+        }
       } finally {
         isDecryptingRef.current = false;
         setIsDecrypting(false);
@@ -123,7 +314,35 @@ export const useFHEDecrypt = (params: {
     };
 
     run();
-  }, [instance, ethersSigner, fhevmDecryptionSignatureStorage, chainId, requests, requestsKey]);
+  }, [instance, signTypedData, getAddress, fhevmDecryptionSignatureStorage, chainId, requests, requestsKey, retryConfig, onSuccess, onError]);
 
-  return { canDecrypt, decrypt, isDecrypting, message, results, error, setMessage, setError } as const;
+  // Auto-decrypt when requests change
+  useEffect(() => {
+    if (autoDecrypt && canDecrypt && requestsKey !== lastReqKeyRef.current) {
+      decrypt(0);
+    }
+  }, [autoDecrypt, canDecrypt, requestsKey, decrypt]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+        retryTimeoutRef.current = null;
+      }
+    };
+  }, []);
+
+  return {
+    canDecrypt,
+    decrypt: () => decrypt(0),
+    isDecrypting,
+    message,
+    results,
+    error,
+    errorMessage,
+    retryCount,
+    setMessage,
+    setError,
+  } as const;
 };

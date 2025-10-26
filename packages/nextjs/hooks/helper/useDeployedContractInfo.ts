@@ -9,6 +9,7 @@ import {
   UseDeployedContractConfig,
   contracts,
 } from "~~/utils/helper/contract";
+import { validateAddress, logDebug, logError, handleError } from "~/lib/utils";
 
 type DeployedContractData<TContractName extends ContractName> = {
   data: Contract<TContractName> | undefined;
@@ -56,22 +57,34 @@ export function useDeployedContractInfo<TContractName extends ContractName>(
         if (!isMounted() || !publicClient) return;
 
         if (!deployedContract) {
+          logDebug(`Contract ${contractName} not found in configuration`);
           setStatus(ContractCodeStatus.NOT_FOUND);
           return;
         }
 
+        // Validate contract address
+        if (!validateAddress(deployedContract.address)) {
+          logError(`Invalid contract address for ${contractName}`, deployedContract.address);
+          setStatus(ContractCodeStatus.NOT_FOUND);
+          return;
+        }
+
+        logDebug(`Checking deployment for ${contractName} at ${deployedContract.address}`);
         const code = await publicClient.getBytecode({
           address: deployedContract.address,
         });
 
         // If contract code is `0x` => no contract deployed on that address
         if (code === "0x") {
+          logDebug(`No contract code found at ${deployedContract.address}`);
           setStatus(ContractCodeStatus.NOT_FOUND);
           return;
         }
+        logDebug(`Contract ${contractName} is deployed`);
         setStatus(ContractCodeStatus.DEPLOYED);
       } catch (e) {
-        console.error(e);
+        const errorMsg = handleError(e);
+        logError(`Error checking contract deployment for ${contractName}`, e);
         setStatus(ContractCodeStatus.NOT_FOUND);
       }
     };

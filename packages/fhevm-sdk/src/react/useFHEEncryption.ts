@@ -1,101 +1,190 @@
 "use client";
 
-import { useCallback, useMemo } from "react";
-import { FhevmInstance } from "../fhevmTypes.js";
-import { RelayerEncryptedInput } from "@zama-fhe/relayer-sdk/web";
-import { ethers } from "ethers";
+import { useCallback, useMemo, useState } from "react";
+import type { FhevmInstance } from "../core/types";
+import type { EncryptResult } from "../core/encryption";
+import { FhevmError, FhevmErrorCode, getErrorMessage } from "../types/errors";
+import type { RelayerEncryptedInput } from "@zama-fhe/relayer-sdk/web";
+import type { GetAddressCallback } from "../types/callbacks";
 
-export type EncryptResult = {
-  handles: Uint8Array[];
-  inputProof: Uint8Array;
-};
+// Re-export encryption utilities from core for convenience
+export {
+  type EncryptResult,
+  getEncryptionMethod,
+  toHex,
+  buildParamsFromAbi,
+  encryptValue,
+  createEncryptedInput,
+  isValidEncryptionValue,
+} from "../core/encryption";
 
-// Map external encrypted integer type to RelayerEncryptedInput builder method
-export const getEncryptionMethod = (internalType: string) => {
-  switch (internalType) {
-    case "externalEbool":
-      return "addBool" as const;
-    case "externalEuint8":
-      return "add8" as const;
-    case "externalEuint16":
-      return "add16" as const;
-    case "externalEuint32":
-      return "add32" as const;
-    case "externalEuint64":
-      return "add64" as const;
-    case "externalEuint128":
-      return "add128" as const;
-    case "externalEuint256":
-      return "add256" as const;
-    case "externalEaddress":
-      return "addAddress" as const;
-    default:
-      console.warn(`Unknown internalType: ${internalType}, defaulting to add64`);
-      return "add64" as const;
-  }
-};
-
-// Convert Uint8Array or hex-like string to 0x-prefixed hex string
-export const toHex = (value: Uint8Array | string): `0x${string}` => {
-  if (typeof value === "string") {
-    return (value.startsWith("0x") ? value : `0x${value}`) as `0x${string}`;
-  }
-  // value is Uint8Array
-  return ("0x" + Buffer.from(value).toString("hex")) as `0x${string}`;
-};
-
-// Build contract params from EncryptResult and ABI for a given function
-export const buildParamsFromAbi = (enc: EncryptResult, abi: any[], functionName: string): any[] => {
-  const fn = abi.find((item: any) => item.type === "function" && item.name === functionName);
-  if (!fn) throw new Error(`Function ABI not found for ${functionName}`);
-
-  return fn.inputs.map((input: any, index: number) => {
-    const raw = index === 0 ? enc.handles[0] : enc.inputProof;
-    switch (input.type) {
-      case "bytes32":
-      case "bytes":
-        return toHex(raw);
-      case "uint256":
-        return BigInt(raw as unknown as string);
-      case "address":
-      case "string":
-        return raw as unknown as string;
-      case "bool":
-        return Boolean(raw);
-      default:
-        console.warn(`Unknown ABI param type ${input.type}; passing as hex`);
-        return toHex(raw);
-    }
-  });
-};
-
-export const useFHEEncryption = (params: {
+/**
+ * Parameters for useFHEEncryption hook
+ */
+export interface UseFHEEncryptionParams {
+  /** FHEVM instance for encryption operations */
   instance: FhevmInstance | undefined;
-  ethersSigner: ethers.JsonRpcSigner | undefined;
+  /** Callback for getting user address (framework-agnostic) */
+  getAddress: GetAddressCallback | undefined;
+  /** Contract address for encryption context */
   contractAddress: `0x${string}` | undefined;
-}) => {
-  const { instance, ethersSigner, contractAddress } = params;
+  /** Callback fired on successful encryption */
+  onSuccess?: (result: EncryptResult) => void;
+  /** Callback fired on encryption error */
+  onError?: (error: Error) => void;
+}
+
+/**
+ * Return type for useFHEEncryption hook
+ */
+export interface UseFHEEncryptionReturn {
+  /** Whether encryption is possible (all dependencies ready) */
+  canEncrypt: boolean;
+  /** Encrypt values using a builder function */
+  encryptWith: (buildFn: (builder: RelayerEncryptedInput) => void) => Promise<EncryptResult | undefined>;
+  /** Encrypt multiple values in batch */
+  encryptBatch: (buildFn: (builder: RelayerEncryptedInput) => void) => Promise<EncryptResult | undefined>;
+  /** Current encryption state */
+  isEncrypting: boolean;
+  /** Last encryption error */
+  error: Error | undefined;
+  /** User-friendly error message */
+  errorMessage: string | undefined;
+}
+
+/**
+ * Hook for encrypting values for FHEVM contracts
+ *
+ * Provides encryption utilities with loading states and error handling.
+ * Supports both single and batch encryption operations.
+ *
+ * @example
+ * ```typescript
+ * const { getAddress } = useWalletCallbacks({ ethersSigner });
+ * const { canEncrypt, encryptWith, isEncrypting } = useFHEEncryption({
+ *   instance,
+ *   getAddress,
+ *   contractAddress,
+ *   onSuccess: (result) => console.log('Encrypted:', result),
+ *   onError: (error) => console.error('Encryption failed:', error)
+ * });
+ *
+ * // Encrypt a single value
+ * const encrypted = await encryptWith(builder => {
+ *   builder.add32(42);
+ * });
+ * ```
+ */
+export const useFHEEncryption = (params: UseFHEEncryptionParams): UseFHEEncryptionReturn => {
+  const { instance, getAddress, contractAddress, onSuccess, onError } = params;
+
+  const [isEncrypting, setIsEncrypting] = useState(false);
+  const [error, setError] = useState<Error | undefined>(undefined);
+  const [errorMessage, setErrorMessage] = useState<string | undefined>(undefined);
 
   const canEncrypt = useMemo(
-    () => Boolean(instance && ethersSigner && contractAddress),
-    [instance, ethersSigner, contractAddress],
+    () => Boolean(instance && getAddress && contractAddress && !isEncrypting),
+    [instance, getAddress, contractAddress, isEncrypting],
   );
 
   const encryptWith = useCallback(
     async (buildFn: (builder: RelayerEncryptedInput) => void): Promise<EncryptResult | undefined> => {
-      if (!instance || !ethersSigner || !contractAddress) return undefined;
+      // Validation
+      if (!instance) {
+        const err = new FhevmError(
+          FhevmErrorCode.INSTANCE_NOT_READY,
+          "FHEVM instance is not ready. Please wait for instance initialization."
+        );
+        setError(err);
+        setErrorMessage(getErrorMessage(err));
+        if (onError) onError(err);
+        return undefined;
+      }
 
-      const userAddress = await ethersSigner.getAddress();
-      const input = instance.createEncryptedInput(contractAddress, userAddress) as RelayerEncryptedInput;
-      buildFn(input);
-      const enc = await input.encrypt();
-      return enc;
+      if (!getAddress) {
+        const err = new FhevmError(
+          FhevmErrorCode.MISSING_PARAMETER,
+          "getAddress callback is required for encryption. Please connect your wallet."
+        );
+        setError(err);
+        setErrorMessage(getErrorMessage(err));
+        if (onError) onError(err);
+        return undefined;
+      }
+
+      if (!contractAddress) {
+        const err = new FhevmError(
+          FhevmErrorCode.INVALID_ADDRESS,
+          "Contract address is required for encryption."
+        );
+        setError(err);
+        setErrorMessage(getErrorMessage(err));
+        if (onError) onError(err);
+        return undefined;
+      }
+
+      setIsEncrypting(true);
+      setError(undefined);
+      setErrorMessage(undefined);
+
+      try {
+        const userAddress = await getAddress();
+        const input = instance.createEncryptedInput(contractAddress, userAddress) as RelayerEncryptedInput;
+
+        // Call the builder function to add values
+        buildFn(input);
+
+        // Perform encryption
+        const enc = await input.encrypt();
+
+        setIsEncrypting(false);
+
+        // Call success callback
+        if (onSuccess) {
+          try {
+            onSuccess(enc);
+          } catch (callbackError) {
+            console.error("[useFHEEncryption] onSuccess callback error:", callbackError);
+          }
+        }
+
+        return enc;
+      } catch (e) {
+        const err = e instanceof Error ? e : new Error(String(e));
+        const fhevmErr = new FhevmError(
+          FhevmErrorCode.ENCRYPTION_FAILED,
+          `Encryption failed: ${err.message}`,
+          err
+        );
+
+        setError(fhevmErr);
+        setErrorMessage(getErrorMessage(fhevmErr));
+        setIsEncrypting(false);
+
+        // Call error callback
+        if (onError) {
+          try {
+            onError(fhevmErr);
+          } catch (callbackError) {
+            console.error("[useFHEEncryption] onError callback error:", callbackError);
+          }
+        }
+
+        return undefined;
+      }
     },
-    [instance, ethersSigner, contractAddress],
+    [instance, getAddress, contractAddress, onSuccess, onError],
   );
+
+  // Alias for batch encryption (same implementation for now)
+  const encryptBatch = encryptWith;
 
   return {
     canEncrypt,
     encryptWith,
+    encryptBatch,
+    isEncrypting,
+    error,
+    errorMessage,
   } as const;
 };

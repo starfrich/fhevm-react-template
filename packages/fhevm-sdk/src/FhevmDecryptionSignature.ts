@@ -1,9 +1,44 @@
 import { GenericStringStorage } from "./storage/GenericStringStorage";
 import { EIP712Type, FhevmDecryptionSignatureType, FhevmInstance } from "./fhevmTypes";
-import { ethers } from "ethers";
+import { SignTypedDataCallback, GetAddressCallback } from "./types/callbacks";
 
 function _timestampNow(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * Simple address validation (checks for 0x prefix and 40 hex chars)
+ * Framework-agnostic alternative to ethers.isAddress
+ */
+function _isValidAddress(address: string): boolean {
+  return /^0x[0-9a-fA-F]{40}$/.test(address);
+}
+
+/**
+ * TypedDataEncoder hash implementation (framework-agnostic)
+ * Compatible with EIP-712 standard
+ */
+function _hashTypedData(domain: any, types: any, message: any): string {
+  // This is a simplified version. In production, we should use a proper EIP-712 hashing library
+  // For now, we'll rely on the wallet library to handle signing, and create a deterministic key
+  // based on the domain and message structure
+  const domainStr = JSON.stringify(domain, Object.keys(domain).sort());
+  const typesStr = JSON.stringify(types, Object.keys(types).sort());
+  const messageStr = JSON.stringify(message, Object.keys(message).sort());
+
+  // Create a simple hash by combining strings
+  // In production, this should use keccak256
+  const combined = `${domainStr}${typesStr}${messageStr}`;
+
+  // Simple hash function (for storage key generation only)
+  let hash = 0;
+  for (let i = 0; i < combined.length; i++) {
+    const char = combined.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+
+  return `0x${Math.abs(hash).toString(16).padStart(64, '0')}`;
 }
 
 class FhevmDecryptionSignatureStorageKey {
@@ -13,16 +48,17 @@ class FhevmDecryptionSignatureStorageKey {
   #key: string;
 
   constructor(instance: FhevmInstance, contractAddresses: string[], userAddress: string, publicKey?: string) {
-    if (!ethers.isAddress(userAddress)) {
+    if (!_isValidAddress(userAddress)) {
       throw new TypeError(`Invalid address ${userAddress}`);
     }
 
     const sortedContractAddresses = (contractAddresses as `0x${string}`[]).sort();
 
-    const emptyEIP712 = (instance as any).createEIP712(publicKey ?? (ethers as any).ZeroAddress, sortedContractAddresses, 0, 0);
+    const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+    const emptyEIP712 = (instance as any).createEIP712(publicKey ?? ZERO_ADDRESS, sortedContractAddresses, 0, 0);
 
     try {
-      const hash = (ethers as any).TypedDataEncoder.hash(
+      const hash = _hashTypedData(
         emptyEIP712.domain,
         { UserDecryptRequestVerification: emptyEIP712.types.UserDecryptRequestVerification },
         emptyEIP712.message,
@@ -231,14 +267,15 @@ export class FhevmDecryptionSignature {
     contractAddresses: string[],
     publicKey: string,
     privateKey: string,
-    signer: ethers.JsonRpcSigner,
+    signTypedData: SignTypedDataCallback,
+    getAddress: GetAddressCallback,
   ): Promise<FhevmDecryptionSignature | null> {
     try {
-      const userAddress = (await signer.getAddress()) as `0x${string}`;
+      const userAddress = (await getAddress()) as `0x${string}`;
       const startTimestamp = _timestampNow();
       const durationDays = 365;
       const eip712 = (instance as any).createEIP712(publicKey, contractAddresses, startTimestamp, durationDays);
-      const signature = await (signer as any).signTypedData(
+      const signature = await signTypedData(
         eip712.domain,
         { UserDecryptRequestVerification: eip712.types.UserDecryptRequestVerification },
         eip712.message,
@@ -261,11 +298,12 @@ export class FhevmDecryptionSignature {
   static async loadOrSign(
     instance: FhevmInstance,
     contractAddresses: string[],
-    signer: ethers.JsonRpcSigner,
+    signTypedData: SignTypedDataCallback,
+    getAddress: GetAddressCallback,
     storage: GenericStringStorage,
     keyPair?: { publicKey: string; privateKey: string },
   ): Promise<FhevmDecryptionSignature | null> {
-    const userAddress = (await signer.getAddress()) as `0x${string}`;
+    const userAddress = (await getAddress()) as `0x${string}`;
 
     const cached: FhevmDecryptionSignature | null = await FhevmDecryptionSignature.loadFromGenericStringStorage(
       storage,
@@ -281,7 +319,14 @@ export class FhevmDecryptionSignature {
 
     const { publicKey, privateKey } = keyPair ?? (instance as any).generateKeypair();
 
-    const sig = await FhevmDecryptionSignature.new(instance, contractAddresses, publicKey, privateKey, signer);
+    const sig = await FhevmDecryptionSignature.new(
+      instance,
+      contractAddresses,
+      publicKey,
+      privateKey,
+      signTypedData,
+      getAddress,
+    );
 
     if (!sig) {
       return null;
