@@ -256,14 +256,19 @@ describe("Retry Utils", () => {
         .fn()
         .mockRejectedValue(new FhevmError(FhevmErrorCode.NETWORK_ERROR));
 
-      const result = await retryAsyncWithTimeout(operation, 50, {
+      // Use more reliable timing: shorter timeout and longer delays
+      // This ensures timeout will always trigger before retries complete
+      const result = await retryAsyncWithTimeout(operation, 100, {
         maxRetries: 10,
-        initialDelayMs: 20,
+        initialDelayMs: 50,
         useJitter: false
       });
 
       expect(result.success).toBe(false);
       expect(result.error).toBeInstanceOf(FhevmError);
+      // Verify we got some attempts but were cut short by timeout
+      expect(result.attempts).toBeGreaterThan(0);
+      expect(result.attempts).toBeLessThan(10); // Should not reach max retries
     });
   });
 
