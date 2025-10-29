@@ -83,6 +83,9 @@ fhevm-universal-sdk/
 git clone <repository-url>
 cd fhevm-react-template
 
+# Initialize submodules (includes fhevm-hardhat-template)
+git submodule update --init --recursive
+
 # Install dependencies
 pnpm install
 ```
