@@ -1,5 +1,9 @@
 # Universal FHEVM SDK
 
+[![codecov](https://codecov.io/gh/starfrich/fhevm-react-template/branch/main/graph/badge.svg)](https://codecov.io/gh/starfrich/fhevm-react-template)
+[![CI](https://github.com/starfrich/fhevm-react-template/actions/workflows/test-coverage.yml/badge.svg)](https://github.com/starfrich/fhevm-react-template/actions/workflows/test-coverage.yml)
+
+
 A framework-agnostic frontend toolkit that helps developers run confidential dApps with ease.
 
 ## 🌐 Live Demos
